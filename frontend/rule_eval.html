@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>规则效果评估 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+let charts = {};
+let state = { start: 0, end: 0, tag: "", ruleId: "", coldHits: 3 };
+
+function initChart(id) {
+  if (!charts[id]) charts[id] = echarts.init(document.getElementById(id));
+  return charts[id];
+}
+window.addEventListener("resize", () => Object.values(charts).forEach(c => c.resize()));
+
+/* ---------- 筛选参数 ---------- */
+function setQuickRange(sec) {
+  state.end = Math.floor(Date.now() / 1000);
+  state.start = state.end - sec;
+}
+function currentQuery() {
+  const p = new URLSearchParams();
+  p.set("start", state.start);
+  p.set("end", state.end);
+  if (state.tag) p.set("tag", state.tag);
+  if (state.ruleId) p.set("rule_id", state.ruleId);
+  p.set("cold_hits", state.coldHits);
+  return p.toString();
+}
+function onQuickChange() {
+  const v = document.getElementById("f-quick").value;
+  const custom = v === "custom";
+  document.querySelectorAll(".custom-range").forEach(el => el.classList.toggle("hidden", !custom));
+  if (!custom) { setQuickRange(parseInt(v, 10)); loadAll(); }
+}
+function applyCustom() {
+  const s = document.getElementById("f-start").value;
+  const e = document.getElementById("f-end").value;
+  if (!s || !e) { UI.toast("请选择开始与结束时间", "warn"); return; }
+  state.start = Math.floor(new Date(s).getTime() / 1000);
+  state.end = Math.floor(new Date(e).getTime() / 1000);
+  loadAll();
+}
+
+/* ---------- 数据加载 ---------- */
+async function loadAll() {
+  state.tag = document.getElementById("f-tag").value;
+  state.ruleId = document.getElementById("f-rule").value;
+  state.coldHits = parseInt(document.getElementById("f-cold").value, 10) || 3;
+  const qs = currentQuery();
+  try {
+    const [sum, trend, ovl] = await Promise.all([
+      API.get("/api/rule_eval?" + qs),
+      API.get("/api/rule_eval/trend?" + qs),
+      API.get("/api/rule_eval/overlap?" + qs),
+    ]);
+    renderFilters(sum.eval);
+    renderCold(sum.eval.cold_rules);
+    renderTiles(sum.eval.totals);
+    renderTable(sum.eval.rules);
+    renderTrend(trend.trend);
+    renderOverlap(ovl.overlap);
+  } catch (e) {
+    UI.toast(e.message || "加载失败", "err");
+  }
+}
+
+/* ---------- 筛选下拉（保留当前选中） ---------- */
+function renderFilters(ev) {
+  const tagSel = document.getElementById("f-tag");
+  if (tagSel.dataset.filled !== "1") {
+    tagSel.innerHTML = `<option value="">全部标签</option>` +
+      (ev.tags || []).map(t => `<option value="${UI.esc(t)}">${UI.esc(t)}</option>`).join("");
+    tagSel.dataset.filled = "1";
+  }
+  const ruleSel = document.getElementById("f-rule");
+  if (ruleSel.dataset.filled !== "1") {
+    ruleSel.innerHTML = `<option value="">全部规则</option>` +
+      ev.rules.filter(r => !r.deleted)
+        .map(r => `<option value="${UI.esc(r.rule_id)}">${UI.esc(r.name)}</option>`).join("");
+    ruleSel.dataset.filled = "1";
+  }
+  tagSel.value = state.tag;
+  ruleSel.value = state.ruleId;
+}
+
+/* ---------- 冷门规则提醒 ---------- */
+function renderCold(cold) {
+  const box = document.getElementById("cold-banner");
+  const n1 = cold.never_hit.length, n2 = cold.low_hit.length;
+  if (!n1 && !n2) { box.innerHTML = ""; return; }
+  const chip = r => `<span class="badge warning" style="margin:2px 4px 2px 0"
+    title="${UI.esc(r.rule_id)}">${UI.esc(r.name)}</span>`;
+  box.innerHTML = `
+    <div class="card" style="border-color:#f59e0b;background:#fffbeb">
+      <h3>⚠️ 冷门规则提醒</h3>
+      <div class="sub">以下启用中的规则在选定时间范围内命中异常，建议检查条件是否过严、事件字段是否缺失，或考虑下线以精简规则集</div>
+      ${n1 ? `<div class="mb"><b>从未命中（${n1} 条）：</b>${cold.never_hit.map(chip).join("")}</div>` : ""}
+      ${n2 ? `<div><b>命中极低（&lt; ${cold.threshold} 次，共 ${n2} 条）：</b>${cold.low_hit.map(chip).join("")}</div>` : ""}
+    </div>`;
+}
+
+/* ---------- 顶部磁贴 ---------- */
+function renderTiles(t) {
+  document.getElementById("tiles").innerHTML = `
+    <div class="grid cols-4">
+      <div class="stat"><div class="label">区间总事件</div><div class="value">${t.events}</div><div class="hint">命中事件 ${t.matched}</div></div>
+      <div class="stat"><div class="label">整体命中率</div><div class="value primary">${(t.hit_rate * 100).toFixed(1)}%</div><div class="hint">命中事件 / 总事件</div></div>
+      <div class="stat"><div class="label">多规则重叠率</div><div class="value warning">${(t.multi_hit_ratio * 100).toFixed(1)}%</div><div class="hint">命中 ≥2 条规则的事件 ${t.multi_hit}</div></div>
+      <div class="stat"><div class="label">冷门规则</div><div class="value ${t.cold_rules ? "danger" : "success"}">${t.cold_rules}</div><div class="hint">共 ${t.rules} 条规则参与评估</div></div>
+    </div>`;
+}
+
+/* ---------- 规则明细表 ---------- */
+const VERDICT = {
+  never_hit: ["从未命中", "danger"],
+  low_hit: ["命中极低", "warning"],
+  normal: ["正常", "success"],
+  disabled: ["已停用", "muted"],
+  deleted: ["已删除", "muted"],
+};
+function renderTable(rules) {
+  const el = document.getElementById("rule-table");
+  if (!rules.length) {
+    el.innerHTML = `<tr><td class="empty">当前筛选条件下没有规则</td></tr>`;
+    return;
+  }
+  const rows = rules.map(r => {
+    const [vLabel, vCls] = VERDICT[r.verdict] || [r.verdict, "muted"];
+    const tags = (r.tags || []).map(t => `<span class="badge muted">${UI.esc(t)}</span>`).join(" ");
+    const cold = r.verdict === "never_hit" || r.verdict === "low_hit";
+    return `<tr class="clickable" style="${cold ? "background:#fffbeb" : ""}"
+      onclick="drillRule('${UI.esc(r.rule_id)}')" title="点击查看该规则趋势">
+      <td><div>${UI.esc(r.name)}</div><div class="muted mono" style="font-size:11px">${UI.esc(r.rule_id)}</div></td>
+      <td>${tags || '<span class="muted">-</span>'}</td>
+      <td>${r.action === "-" ? "-" : UI.actionBadge(r.action)}</td>
+      <td>${r.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+      <td class="num"><b>${r.hits}</b></td>
+      <td class="num">${r.reject}</td>
+      <td class="num">${r.review}</td>
+      <td class="num">${r.alerts}</td>
+      <td class="num">${(r.hit_rate * 100).toFixed(2)}%</td>
+      <td class="num">${(r.coverage * 100).toFixed(1)}%</td>
+      <td class="num">${r.last_hit ? UI.fmtTime(r.last_hit) : '<span class="muted">从未</span>'}</td>
+      <td><span class="badge ${vCls}">${vLabel}</span></td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `
+    <thead><tr>
+      <th>规则</th><th>标签</th><th>动作</th><th>状态</th>
+      <th class="num">命中量</th><th class="num">拦截</th><th class="num">复核</th><th class="num">告警量</th>
+      <th class="num">命中率</th><th class="num">覆盖率</th><th class="num">最近命中</th><th>评估</th>
+    </tr></thead><tbody>${rows}</tbody>`;
+}
+function drillRule(ruleId) {
+  document.getElementById("f-rule").value = ruleId;
+  loadAll();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+/* ---------- 命中量趋势 ---------- */
+function renderTrend(trend) {
+  const fmt = trend.bucket_sec >= 86400
+    ? ts => new Date(ts * 1000).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })
+    : ts => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+  const labels = trend.buckets.map(fmt);
+  document.getElementById("trend-hint").textContent =
+    trend.series.length ? "" : "选定范围内暂无规则命中数据";
+  initChart("chart-trend").setOption({
+    tooltip: { trigger: "axis" },
+    legend: { bottom: 0, type: "scroll" },
+    grid: { left: 46, right: 20, top: 30, bottom: 46 },
+    xAxis: { type: "category", data: labels, boundaryGap: false },
+    yAxis: { type: "value", name: "命中量", minInterval: 1 },
+    series: trend.series.map(s => ({
+      name: s.name, type: "line", smooth: true, data: s.data,
+      showSymbol: false, areaStyle: { opacity: .06 },
+    })),
+  }, true);
+}
+
+/* ---------- 命中重叠 ---------- */
+function renderOverlap(ovl) {
+  document.getElementById("overlap-summary").innerHTML = `
+    命中事件 <b>${ovl.matched_events}</b> 起，其中 <b>${ovl.multi_hit_events}</b> 起同时命中多条规则
+    （重叠率 <b class="${ovl.multi_hit_ratio > 0.3 ? "" : ""}">${(ovl.multi_hit_ratio * 100).toFixed(1)}%</b>）`;
+
+  // 热力图：取有共现的规则（最多 12 条，保证可读性）
+  const involved = new Set();
+  ovl.pairs.forEach(p => { involved.add(p.a); involved.add(p.b); });
+  const rules = ovl.rules.filter(r => involved.has(r.rule_id)).slice(0, 12);
+  const names = rules.map(r => r.name.length > 8 ? r.name.slice(0, 8) + "…" : r.name);
+  const idx = {};
+  rules.forEach((r, i) => { idx[r.rule_id] = i; });
+  const data = [];
+  let maxCount = 1;
+  ovl.pairs.forEach(p => {
+    if (idx[p.a] === undefined || idx[p.b] === undefined) return;
+    data.push([idx[p.b], idx[p.a], p.count]);
+    data.push([idx[p.a], idx[p.b], p.count]);
+    maxCount = Math.max(maxCount, p.count);
+  });
+  const chart = initChart("chart-overlap");
+  if (!rules.length) {
+    chart.clear();
+    document.getElementById("overlap-empty").classList.remove("hidden");
+  } else {
+    document.getElementById("overlap-empty").classList.add("hidden");
+    chart.setOption({
+      tooltip: { formatter: p => `${names[p.value[1]]} × ${names[p.value[0]]}<br>共现 ${p.value[2]} 次` },
+      grid: { left: 90, right: 16, top: 10, bottom: 60 },
+      xAxis: { type: "category", data: names, axisLabel: { rotate: 35, fontSize: 11 } },
+      yAxis: { type: "category", data: names, axisLabel: { fontSize: 11 } },
+      visualMap: { min: 0, max: maxCount, calculable: true, orient: "horizontal",
+        left: "center", bottom: 0, inRange: { color: ["#eff6ff", "#2563eb"] } },
+      series: [{ type: "heatmap", data, label: { show: true, fontSize: 10 } }],
+    }, true);
+  }
+
+  // 规则对 TOP 表
+  const tbl = document.getElementById("pair-table");
+  if (!ovl.pairs.length) {
+    tbl.innerHTML = `<tr><td class="empty">选定范围内没有规则共现记录</td></tr>`;
+  } else {
+    tbl.innerHTML = `<thead><tr>
+        <th>规则 A</th><th>规则 B</th><th class="num">共现次数</th>
+        <th class="num">占 A 命中</th><th class="num">占 B 命中</th>
+      </tr></thead><tbody>` + ovl.pairs.slice(0, 15).map(p => `
+      <tr><td>${UI.esc(p.a_name)}</td><td>${UI.esc(p.b_name)}</td>
+        <td class="num"><b>${p.count}</b></td>
+        <td class="num">${(p.pct_of_a * 100).toFixed(1)}%</td>
+        <td class="num">${(p.pct_of_b * 100).toFixed(1)}%</td></tr>`).join("") + `</tbody>`;
+  }
+}
+
+/* ---------- 导出 ---------- */
+function doExport(fmt) {
+  const qs = currentQuery();
+  window.location = "/api/rule_eval/export?fmt=" + fmt + "&" + qs;
+  UI.toast("导出任务已开始", "ok");
+}
+
+boot("规则效果评估", () => {
+  const page = document.getElementById("page");
+  page.innerHTML = `
+    <div class="card">
+      <div class="row" style="flex-wrap:wrap">
+        <div class="field" style="min-width:140px"><label>时间范围</label>
+          <select id="f-quick" onchange="onQuickChange()">
+            <option value="3600">最近 1 小时</option>
+            <option value="21600">最近 6 小时</option>
+            <option value="86400" selected>最近 24 小时</option>
+            <option value="604800">最近 7 天</option>
+            <option value="custom">自定义…</option>
+          </select></div>
+        <div class="field custom-range hidden" style="min-width:200px"><label>开始</label>
+          <input type="datetime-local" id="f-start"></div>
+        <div class="field custom-range hidden" style="min-width:200px"><label>结束</label>
+          <input type="datetime-local" id="f-end"></div>
+        <div class="field custom-range hidden" style="flex:0 0 auto"><label>&nbsp;</label>
+          <button class="btn primary" onclick="applyCustom()">应用</button></div>
+        <div class="field" style="min-width:130px"><label>规则标签</label>
+          <select id="f-tag" onchange="loadAll()"><option value="">全部标签</option></select></div>
+        <div class="field" style="min-width:170px"><label>规则</label>
+          <select id="f-rule" onchange="loadAll()"><option value="">全部规则</option></select></div>
+        <div class="field" style="max-width:110px"><label>冷门阈值(次)</label>
+          <input type="number" id="f-cold" value="3" min="1" max="1000" onchange="loadAll()"></div>
+        <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
+          <div class="flex">
+            <button class="btn primary" onclick="loadAll()">查询</button>
+            <button class="btn" onclick="doExport('csv')">导出 CSV</button>
+            <button class="btn" onclick="doExport('json')">导出 JSON</button>
+          </div></div>
+      </div>
+    </div>
+    <div id="cold-banner"></div>
+    <div id="tiles"></div>
+    <div class="card">
+      <div class="card-head"><h3>规则命中量趋势</h3><span class="muted" id="trend-hint"></span></div>
+      <div id="chart-trend" style="height:320px"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>规则效果明细</h3>
+        <span class="muted">命中率=命中量/总事件 · 覆盖率=命中量/命中事件 · 点击行可下钻</span></div>
+      <div class="table-wrap"><table id="rule-table"></table></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>规则命中重叠</h3>
+        <div class="sub" id="overlap-summary"></div>
+        <div id="chart-overlap" style="height:360px"></div>
+        <div id="overlap-empty" class="empty hidden">选定范围内没有规则共现记录</div>
+      </div>
+      <div class="card">
+        <h3>重叠规则对 TOP</h3>
+        <div class="sub">同一事件同时命中两条规则的统计，占比=共现次数/该规则命中量</div>
+        <div class="table-wrap"><table id="pair-table"></table></div>
+      </div>
+    </div>`;
+  setQuickRange(86400);
+  loadAll();
+});
+</script>
+</body>
+</html>

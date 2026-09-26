@@ -24,6 +24,7 @@ PAGES = [
     ("events.html", "实时事件流"),
     ("alerts.html", "告警列表"),
     ("stats.html", "统计报表"),
+    ("rule_eval.html", "规则效果评估"),
     ("users.html", "用户管理"),
     ("versions.html", "规则版本管理"),
     ("sandbox.html", "测试沙箱"),

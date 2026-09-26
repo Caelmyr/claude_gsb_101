@@ -35,8 +35,10 @@ def create_app():
 
     # ---- 注册 API 蓝图 ----
     from backend.api import (rules, events, alerts, stats, users,
-                             settings, sandbox, dict as dict_api, flows as flows_api)
-    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api, flows_api):
+                             settings, sandbox, dict as dict_api, flows as flows_api,
+                             rule_eval)
+    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api,
+                   flows_api, rule_eval):
         app.register_blueprint(module.bp)
 
     # ---- 认证 ----
@@ -113,10 +115,14 @@ app = create_app()
 
 
 def _shutdown():
-    """进程退出前 flush 事件缓冲。"""
+    """进程退出前 flush 事件缓冲与规则指标缓冲。"""
     if runtime.engine is not None:
         try:
             runtime.engine.events.stop()
+        except Exception:
+            pass
+        try:
+            runtime.engine.rule_metrics.stop()
         except Exception:
             pass
 

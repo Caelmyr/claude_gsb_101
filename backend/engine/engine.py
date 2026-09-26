@@ -20,6 +20,7 @@ import threading
 from backend.engine.hot_update import RuleRegistry
 from backend.engine.window import SlidingWindowAggregator
 from backend.engine.alert import AlertAggregator
+from backend.engine.rule_metrics import RuleMetricsRecorder
 from backend.engine.rule_parser import _get_field
 from backend.event_store import EventStore
 from backend import config
@@ -52,6 +53,8 @@ class RiskEngine:
             max_alert_keep=alert_keep,
         )
         self.events = EventStore()
+        # 规则效果评估指标（分钟桶 + 按天分片持久化）
+        self.rule_metrics = RuleMetricsRecorder()
 
         self._listeners = set()
         self._listener_lock = threading.Lock()
@@ -188,6 +191,11 @@ class RiskEngine:
 
         # 6) 持久化 + 统计
         self.events.add(event, ts=ts)
+        # 规则效果评估指标：辅助观察链路，失败绝不影响主决策流程
+        try:
+            self.rule_metrics.record(ts, fired, alert_results)
+        except Exception:
+            pass
         elapsed_us = int((time.perf_counter() - start) * 1e6)
 
         matched = len(fired) > 0
