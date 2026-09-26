@@ -35,8 +35,10 @@ def create_app():
 
     # ---- 注册 API 蓝图 ----
     from backend.api import (rules, events, alerts, stats, users,
-                             settings, sandbox, dict as dict_api, flows as flows_api)
-    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api, flows_api):
+                             settings, sandbox, dict as dict_api, flows as flows_api,
+                             evaluation)
+    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api,
+                   flows_api, evaluation):
         app.register_blueprint(module.bp)
 
     # ---- 认证 ----

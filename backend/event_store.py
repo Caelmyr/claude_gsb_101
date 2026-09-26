@@ -137,6 +137,72 @@ class EventStore:
             result = result[:limit]
         return result
 
+    def _existing_hour_keys(self, end_ts):
+        """列出磁盘上已存在且不晚于 end_ts 的小时键。"""
+        keys = []
+        if not os.path.isdir(config.EVENTS_DIR):
+            return keys
+        for day in sorted(os.listdir(config.EVENTS_DIR)):
+            day_dir = os.path.join(config.EVENTS_DIR, day)
+            if not os.path.isdir(day_dir):
+                continue
+            for name in sorted(os.listdir(day_dir)):
+                if not name.endswith(".json"):
+                    continue
+                key = f"{day}/{name[:-5]}"
+                try:
+                    day_ts = time.mktime(time.strptime(day, "%Y%m%d"))
+                    hour_ts = day_ts + int(name[:-5]) * 3600
+                except (ValueError, OverflowError):
+                    continue
+                if hour_ts <= end_ts + 3600:
+                    keys.append(key)
+        return keys
+
+    def scan(self, start_ts=None, end_ts=None):
+        """按时间范围扫描原始事件（磁盘分片 + 内存缓冲），不去重、不截断。
+
+        规则效果评估需要完整回放历史事件；与面向实时列表的 ``query`` 不同，
+        本方法不丢弃首条、不限制条数。``start_ts <= 0`` 表示从最早分片开始。
+        """
+        if end_ts is None:
+            end_ts = time.time()
+        if start_ts is None:
+            start_ts = end_ts - 7 * 86400
+
+        if start_ts <= 0:
+            keys = self._existing_hour_keys(end_ts)
+            start_bound = 0
+        else:
+            t = int(start_ts) // 3600 * 3600
+            keys = []
+            while t <= end_ts:
+                keys.append(_hour_key(t))
+                t += 3600
+            start_bound = start_ts
+
+        result = []
+        with self._lock:
+            if start_ts <= 0:
+                # 内存缓冲中的小时分片可能尚未落盘，需与磁盘键合并。
+                keys = sorted(set(keys) | set(self._buffer.keys()))
+            for key in keys:
+                path = _hour_path(key)
+                if os.path.exists(path):
+                    data = read_json(path, {"events": []})
+                    result.extend(data.get("events", []))
+                result.extend(self._buffer.get(key, []))
+
+        bounded = []
+        for event in result:
+            try:
+                ts = float(event.get("ts", 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if start_bound <= ts <= end_ts:
+                bounded.append(event)
+        return bounded
+
     def recent(self, limit=100):
         return self.query(limit=limit)
 

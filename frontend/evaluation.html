@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>规则效果评估 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+let charts = {};
+let lastEvaluation = null;
+
+function initChart(id) {
+  if (!charts[id]) charts[id] = echarts.init(document.getElementById(id));
+  return charts[id];
+}
+window.addEventListener("resize", () => Object.values(charts).forEach(c => c.resize()));
+
+function pct(v) { return ((v || 0) * 100).toFixed(1) + "%"; }
+function num(v) { return Number(v || 0).toLocaleString("zh-CN"); }
+function esc(s) { return UI.esc(s); }
+function actionText(a) { return { reject: "拦截", review: "复核", alert: "告警", pass: "放行" }[a] || a; }
+function coldBadge(status) {
+  if (status === "never") return '<span class="badge danger">从未命中</span>';
+  if (status === "low") return '<span class="badge warning">命中极低</span>';
+  return '<span class="badge success">正常</span>';
+}
+function toLocalInput(ts) {
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fromLocalInput(v) {
+  if (!v) return null;
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+}
+function fmtBucket(ts, granularity) {
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  if (granularity === "day") return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function buildParams() {
+  const p = new URLSearchParams();
+  const start = fromLocalInput(document.getElementById("f-start").value);
+  const end = fromLocalInput(document.getElementById("f-end").value);
+  if (start) p.set("start", start);
+  if (end) p.set("end", end);
+  const tag = document.getElementById("f-tag").value;
+  const dimension = document.getElementById("f-dimension").value;
+  const action = document.getElementById("f-action").value;
+  const status = document.getElementById("f-status").value;
+  const keyword = document.getElementById("f-keyword").value.trim();
+  const low = document.getElementById("f-low").value;
+  if (tag) p.set("tag", tag);
+  if (dimension) p.set("dimension", dimension);
+  if (action) p.set("action", action);
+  if (status) p.set("status", status);
+  if (keyword) p.set("keyword", keyword);
+  if (low !== "") p.set("low_hit_threshold", low);
+  return p;
+}
+
+function fillSelect(id, values, allLabel) {
+  const el = document.getElementById(id);
+  const current = el.value;
+  el.innerHTML = `<option value="">${allLabel}</option>` +
+    (values || []).map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  if ((values || []).includes(current)) el.value = current;
+}
+
+async function refresh() {
+  const r = await API.get("/api/rule-evaluation?" + buildParams().toString());
+  lastEvaluation = r.evaluation;
+  renderAll(lastEvaluation);
+}
+
+function renderSummary(s) {
+  document.getElementById("tiles").innerHTML = `
+    <div class="grid cols-4">
+      <div class="stat"><div class="label">评估事件数</div><div class="value">${num(s.total_events)}</div><div class="hint">命中事件 ${num(s.matched_events)}</div></div>
+      <div class="stat"><div class="label">规则命中量</div><div class="value primary">${num(s.rule_hits)}</div><div class="hint">命中率 ${pct(s.hit_rate)}</div></div>
+      <div class="stat"><div class="label">事件覆盖率</div><div class="value success">${pct(s.coverage)}</div><div class="hint">命中事件 / 总事件</div></div>
+      <div class="stat"><div class="label">命中重叠率</div><div class="value warning">${pct(s.overlap_rate)}</div><div class="hint">重叠事件 ${num(s.overlap_events)}</div></div>
+      <div class="stat"><div class="label">冷门规则</div><div class="value danger">${num(s.cold_rules)}</div><div class="hint">参与评估规则 ${num(s.rules_evaluated)} 条</div></div>
+    </div>`;
+}
+
+function renderCold(coldRules) {
+  const box = document.getElementById("cold-list");
+  if (!coldRules.length) {
+    box.innerHTML = `<div class="empty" style="padding:18px 0">✅ 当前筛选范围内没有冷门规则</div>`;
+    return;
+  }
+  box.innerHTML = coldRules.slice(0, 8).map(r => `
+    <div class="flex between" style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <b>${esc(r.name)}</b> <span class="muted mono">${esc(r.rule_id)}</span>
+        <div class="muted" style="font-size:12px">${esc(r.cold_reason)}</div>
+      </div>
+      ${coldBadge(r.cold_status)}
+    </div>`).join("") +
+    (coldRules.length > 8 ? `<div class="muted mt">其余 ${coldRules.length - 8} 条见下方明细或导出结果</div>` : "");
+}
+
+function renderTrend(trend) {
+  const labels = trend.buckets.map(ts => fmtBucket(ts, trend.granularity));
+  const ranked = trend.series
+    .map(s => ({ ...s, total: s.data.reduce((a, b) => a + b, 0) }))
+    .sort((a, b) => b.total - a.total);
+  let shown = ranked.filter(s => s.total > 0).slice(0, 8);
+  if (!shown.length) shown = ranked.slice(0, 5);
+  const series = shown.map(s => ({
+    name: s.name,
+    type: "bar",
+    stack: "规则命中",
+    barMaxWidth: 28,
+    data: s.data,
+  }));
+  series.push({
+    name: "事件总量",
+    type: "line",
+    yAxisIndex: 1,
+    smooth: true,
+    symbolSize: 5,
+    data: trend.total_events,
+    lineStyle: { color: "#64748b" },
+    itemStyle: { color: "#64748b" },
+  });
+  initChart("chart-trend").setOption({
+    title: { text: "规则命中量时间趋势", left: "center", textStyle: { fontSize: 14 } },
+    tooltip: { trigger: "axis" },
+    legend: { type: "scroll", bottom: 0 },
+    grid: { left: 45, right: 45, top: 42, bottom: 58 },
+    xAxis: { type: "category", data: labels },
+    yAxis: [
+      { type: "value", name: "规则命中量", minInterval: 1 },
+      { type: "value", name: "事件数", minInterval: 1 },
+    ],
+    series,
+  }, true);
+}
+
+function renderOverlap(overlap) {
+  const chart = initChart("chart-overlap");
+  const names = overlap.rules.map(r => r.name);
+  if (!names.length) {
+    chart.clear();
+    chart.setOption({ title: { text: "暂无规则", left: "center", top: "middle", textStyle: { fontSize: 14, color: "#6b7280" } } });
+    return;
+  }
+  const data = overlap.matrix.map(m => [m.x, m.y, +(m.overlap_rate * 100).toFixed(1), m.co_hits, m.rule_x, m.rule_y]);
+  chart.setOption({
+    title: { text: "规则命中重叠矩阵", left: "center", textStyle: { fontSize: 14 } },
+    tooltip: {
+      formatter: p => {
+        const d = p.data;
+        return `${esc(d[5])} × ${esc(d[4])}<br>共同命中：${d[3]} 次<br>重叠比例：${d[2]}%`;
+      }
+    },
+    grid: { left: 90, right: 20, top: 42, bottom: 70 },
+    xAxis: { type: "category", data: names, axisLabel: { rotate: 35 } },
+    yAxis: { type: "category", data: names, inverse: true },
+    visualMap: {
+      min: 0, max: 100, calculable: true, orient: "horizontal", left: "center", bottom: 0,
+      inRange: { color: ["#eff6ff", "#60a5fa", "#1d4ed8"] },
+      text: ["高", "低"],
+    },
+    series: [{
+      type: "heatmap",
+      data,
+      label: { show: names.length <= 8, formatter: p => p.data[2] + "%", fontSize: 10 },
+      emphasis: { itemStyle: { shadowBlur: 8, shadowColor: "rgba(0,0,0,.25)" } },
+    }],
+  }, true);
+}
+
+function renderRules(rows) {
+  const tbody = document.getElementById("rule-metrics");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="13" class="empty">当前筛选条件下没有规则</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td class="mono">${esc(r.rule_id)}</td>
+      <td><b>${esc(r.name)}</b><div class="muted" style="font-size:12px">${esc(r.description || "")}</div></td>
+      <td>${r.dimensions.map(d => UI.badge(d, "primary")).join(" ")}</td>
+      <td>${r.tags.map(t => UI.badge(t)).join(" ") || '<span class="muted">-</span>'}</td>
+      <td>${UI.actionBadge(r.action)}</td>
+      <td>${r.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+      <td class="num"><b>${num(r.hits)}</b></td>
+      <td class="num">${num(r.action_counts.reject)}</td>
+      <td class="num">${num(r.action_counts.review)}</td>
+      <td class="num">${num(r.action_counts.alert)}</td>
+      <td class="num">${pct(r.hit_rate)}</td>
+      <td class="num">${pct(r.coverage)}</td>
+      <td>${coldBadge(r.cold_status)}<div class="muted" style="font-size:11px">${esc(r.cold_reason)}</div></td>
+    </tr>`).join("");
+}
+
+function renderPairs(pairs) {
+  const tbody = document.getElementById("overlap-pairs");
+  if (!pairs.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">评估期内没有多规则共同命中</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = pairs.slice(0, 10).map(p => `
+    <tr>
+      <td class="mono">${esc(p.rule_a)}</td>
+      <td class="mono">${esc(p.rule_b)}</td>
+      <td class="num">${num(p.co_hits)}</td>
+      <td class="num">${pct(p.overlap_rate)}</td>
+      <td class="num">${pct(p.event_coverage)}</td>
+    </tr>`).join("");
+}
+
+function renderAll(data) {
+  fillSelect("f-tag", data.filter_options.tags, "全部标签");
+  fillSelect("f-dimension", data.filter_options.dimensions, "全部维度");
+  renderSummary(data.summary);
+  renderCold(data.cold_rules);
+  renderTrend(data.trend);
+  renderOverlap(data.overlap);
+  renderRules(data.rules);
+  renderPairs(data.overlap.pairs);
+  const warn = document.getElementById("invalid-rules");
+  if (data.invalid_rules && data.invalid_rules.length) {
+    warn.textContent = "有 " + data.invalid_rules.length + " 条规则编译失败，未参与评估";
+    warn.classList.remove("hidden");
+  } else {
+    warn.classList.add("hidden");
+  }
+}
+
+function resetFilters() {
+  const end = Math.floor(Date.now() / 1000);
+  document.getElementById("f-end").value = toLocalInput(end);
+  document.getElementById("f-start").value = toLocalInput(end - 7 * 86400);
+  document.getElementById("f-tag").value = "";
+  document.getElementById("f-dimension").value = "";
+  document.getElementById("f-action").value = "";
+  document.getElementById("f-status").value = "enabled";
+  document.getElementById("f-keyword").value = "";
+  document.getElementById("f-low").value = 5;
+  refresh();
+}
+
+function exportResult(fmt) {
+  const p = buildParams();
+  p.set("fmt", fmt);
+  window.location.href = "/api/rule-evaluation/export?" + p.toString();
+}
+
+boot("规则效果评估", () => {
+  const page = document.getElementById("page");
+  page.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>评估筛选</h3><span class="muted">按当前规则配置回放历史事件，不影响线上窗口与统计</span></div>
+      <div class="grid cols-4">
+        <div class="field"><label>开始时间</label><input id="f-start" type="datetime-local"></div>
+        <div class="field"><label>结束时间</label><input id="f-end" type="datetime-local"></div>
+        <div class="field"><label>规则标签</label><select id="f-tag"><option value="">全部标签</option></select></div>
+        <div class="field"><label>规则维度</label><select id="f-dimension"><option value="">全部维度</option></select></div>
+        <div class="field"><label>动作类型</label><select id="f-action"><option value="">全部动作</option><option value="reject">拦截</option><option value="review">复核</option><option value="alert">告警</option><option value="pass">放行</option></select></div>
+        <div class="field"><label>规则状态</label><select id="f-status"><option value="enabled">启用</option><option value="disabled">停用</option><option value="all">全部</option></select></div>
+        <div class="field"><label>关键词</label><input id="f-keyword" placeholder="规则 ID / 名称 / 描述"></div>
+        <div class="field"><label>冷门阈值（命中 ≤ N）</label><input id="f-low" type="number" min="0" value="5"></div>
+      </div>
+      <div class="flex">
+        <button class="btn primary" onclick="refresh()">查询评估</button>
+        <button class="btn" onclick="resetFilters()">重置</button>
+        <span style="flex:1"></span>
+        <button class="btn" onclick="exportResult('csv')">导出 CSV</button>
+        <button class="btn" onclick="exportResult('json')">导出 JSON</button>
+      </div>
+    </div>
+
+    <div id="tiles"></div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="card-head"><h3>冷门规则提醒</h3><span class="badge warning">需调优</span></div>
+        <div id="cold-list"></div>
+        <div id="invalid-rules" class="badge danger hidden mt"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>口径说明</h3></div>
+        <div class="muted" style="font-size:13px;line-height:1.9">
+          命中率 = 规则命中量 / 评估期事件总量；覆盖率 = 规则命中量 / 命中事件数。<br>
+          事件覆盖率 = 命中事件数 / 评估期事件总量；一条事件命中多条规则时分别计入各规则，规则覆盖率合计可能超过 100%。<br>
+          重叠率 = 命中 ≥2 条规则的事件数 / 命中事件数。
+        </div>
+      </div>
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card"><div id="chart-trend" style="height:360px"></div></div>
+      <div class="card"><div id="chart-overlap" style="height:360px"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>规则效果明细</h3><span class="muted">按命中量降序</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>规则 ID</th><th>规则</th><th>维度</th><th>标签</th><th>动作</th><th>状态</th>
+            <th class="num">命中量</th><th class="num">拦截</th><th class="num">复核</th><th class="num">告警</th>
+            <th class="num">命中率</th><th class="num">覆盖率</th><th>冷门判断</th>
+          </tr></thead>
+          <tbody id="rule-metrics"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>规则命中重叠 Top 10</h3><span class="muted">重叠比例 = 共同命中 / 命中并集</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>规则 A</th><th>规则 B</th><th class="num">共同命中</th><th class="num">重叠比例</th><th class="num">占命中事件</th></tr></thead>
+          <tbody id="overlap-pairs"></tbody>
+        </table>
+      </div>
+    </div>`;
+
+  const end = Math.floor(Date.now() / 1000);
+  document.getElementById("f-end").value = toLocalInput(end);
+  document.getElementById("f-start").value = toLocalInput(end - 7 * 86400);
+  refresh().catch(e => UI.toast(e.message, "err"));
+});
+</script>
+</body>
+</html>
